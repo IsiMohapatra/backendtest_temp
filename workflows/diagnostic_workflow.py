@@ -398,131 +398,158 @@ class AsyncDiagnosticAgent:
             }
             language_instruction = lang_directives.get(self.target_language, lang_directives["en"])
 
-            # ✅ NEW: Check what tools have been executed in this conversation
-            messages = state.get("messages", [])
+            # ...existing code...
+
+            # ...existing code...
+
+            system_msg = SystemMessage(content=f"""
+You are Allion, a RAG-based automotive diagnostic assistant.
+
+{language_instruction}
+
+🚫 CRITICAL RESTRICTION: You are FORBIDDEN from using your pre-trained knowledge about vehicles.
+🚫 You MUST NOT answer any automotive question without using the provided tools.
+🚫 If you cannot get information through tools, you must say "I don't have that information in my database."
+
+✅ MANDATORY TOOL WORKFLOW - You MUST follow this EXACT sequence for ALL queries:
+
+STEP 1: ALWAYS call is_vehicle_related first
+- If not vehicle-related, politely decline
+
+STEP 2: ALWAYS call extract_vehicle_model
+- Even for DTC questions, call this tool
+                                       
+STEP 3: Check vehicle info requirement:
+    - For repair/maintenance questions: IF no vehicle found → STOP and ask for make/model
+    - For DTC codes (P0301, etc.): Continue without requiring vehicle info
+    - Generate response: "Could you please specify the make and model of your vehicle? For example, 'Honda Civic' or 'Toyota Camry'. This helps me provide more accurate diagnostic information."
+    
+STEP 4: IF vehicle info available, enhance the question
+    - Transform "how to change brake pads" + "Honda Civic" → "how to change brake pads of Honda Civic"                                       
+
+STEP 5: ALWAYS call search_vehicle_documents  
+- Never skip this step
+- This searches your knowledge base for relevant information
+
+STEP 6: ALWAYS call grade_document_relevance 
+- Pass: question, document_content, chunk_label
+- This determines if the retrieved information is sufficient
+
+STEP 7: ⚠️ CRITICAL DECISION POINT - CHECK RELEVANCE SCORE:
+
+🟢 IF the grade_document_relevance tool returned relevance_score: 1
+    → Skip to STEP 8 (format_diagnostic_results)
+    → Do NOT call search_web_for_vehicle_info
+    → Do NOT call search_youtube_videos
+
+🔴 IF the grade_document_relevance tool returned relevance_score: 0
+    → You MUST call search_web_for_vehicle_info NEXT
+    → You MUST call search_youtube_videos AFTER that  
+    → ONLY THEN proceed to STEP 8
+    → This is MANDATORY - do not skip these tools when relevance_score = 0
+
+# ...existing code...
+
+STEP 8: ALWAYS call format_diagnostic_results as the FINAL step
+- CRITICAL DATA EXTRACTION REQUIREMENTS:
+  
+  🔴 IF you called search_web_for_vehicle_info:
+    → Extract the "results" field from the tool response
+    → Pass it as web_results: [extracted_results_list]
+    
+  🔴 IF you called search_youtube_videos:
+    → Extract the "youtube_results" field from the tool response  
+    → Pass it as youtube_results: [extracted_youtube_list]
+    
+  🟢 IF you skipped web/youtube search (relevance_score = 1):
+    → Pass empty lists: web_results: [], youtube_results: []
+
+- EXAMPLE DATA EXTRACTION:
+  If search_web_for_vehicle_info returned:
+  {{"results": [{{"url": "...", "title": "...", "content": "..."}}]}}
+  
+  Then pass to format_diagnostic_results:
+  web_results: [{{"url": "...", "title": "...", "content": "..."}}]
+  
+  If search_youtube_videos returned:
+  {{"youtube_results": [{{"url": "...", "video_id": "...", "title": "..."}}]}}
+  
+  Then pass to format_diagnostic_results:
+  youtube_results: [{{"url": "...", "video_id": "...", "title": "..."}}]
+
+- CRITICAL FORMAT REQUIREMENTS:
+  * web_results: MUST be the actual list from the "results" field
+  * youtube_results: MUST be the actual list from the "youtube_results" field  
+  * rag_answer: MUST preserve ALL markdown formatting, images, and tables.Do not summarize the content. Preserve as it is with actual content.
+  * DO NOT modify or summarize the rag_answer content
+
+🚨 DATA PRESERVATION REQUIREMENTS:
+- When relevance_score = 1: Preserve ALL image links, tables, and formatting from RAG content
+- When relevance_score = 0: Include ALL web sources and YouTube videos found
+- NEVER pass empty web_results/youtube_results when data was actually found
+
+# ...existing code...
+
+🚨 FORBIDDEN BEHAVIORS:
+- NEVER call format_diagnostic_results when relevance_score = 0 WITHOUT first calling search_web_for_vehicle_info and search_youtube_videos
+- NEVER skip search_web_for_vehicle_info when relevance_score = 0
+- NEVER skip search_youtube_videos when relevance_score = 0
+- Do NOT use your automotive knowledge when tools return no information
+
+🔍 DECISION FLOWCHART:
+grade_document_relevance returns relevance_score of 0
+                    ↓
+              MUST call search_web_for_vehicle_info
+                    ↓  
+              MUST call search_youtube_videos
+                    ↓
+              THEN call format_diagnostic_results
+
+grade_document_relevance returns relevance_score of 1
+                    ↓
+              SKIP web and youtube search
+                    ↓
+              DIRECTLY call format_diagnostic_results
+
+✅ EXAMPLE CORRECT SEQUENCES:
+
+Scenario A (Good RAG content):
+1. is_vehicle_related
+2. extract_vehicle_model  
+3. search_vehicle_documents
+4. grade_document_relevance → relevance_score: 1
+5. format_diagnostic_results ✅ CORRECT
+
+Scenario B (Poor RAG content):
+1. is_vehicle_related
+2. extract_vehicle_model
+3. search_vehicle_documents  
+4. grade_document_relevance → relevance_score: 0
+5. search_web_for_vehicle_info ← MANDATORY
+6. search_youtube_videos ← MANDATORY
+7. format_diagnostic_results ✅ CORRECT
+
+❌ WRONG SEQUENCE (NEVER DO THIS):
+4. grade_document_relevance → relevance_score: 0
+5. format_diagnostic_results ← FORBIDDEN! Must search web+youtube first
+
+REMEMBER: When relevance_score = 0, you MUST gather additional information from web and YouTube before formatting the final response.
+""")
             
-            # Track completed tools and their results
-            completed_tools = set()
-            tool_results = {}
-            relevance_score = None
+# ...existing code...
             
-            for msg in messages:
-                # Check for tool result messages
-                if hasattr(msg, 'name') and msg.name:
-                    completed_tools.add(msg.name)
-                    # Store the result for decision making
-                    if hasattr(msg, 'content'):
-                        tool_results[msg.name] = msg.content
-                        
-                        # Extract relevance score if available
-                        if msg.name == 'grade_document_relevance':
-                            try:
-                                grade_result = json.loads(msg.content)
-                                relevance_score = grade_result.get('relevance_score', 0)
-                            except (json.JSONDecodeError, TypeError):
-                                relevance_score = 0
+# ...existing code...
             
-            # ✅ Dynamic system prompt based on conversation state
-            if len(completed_tools) == 0:
-                # First interaction - start workflow
-                system_msg = SystemMessage(content=f"""
-        You are Allion, a RAG-based automotive diagnostic assistant.
-
-        {language_instruction}
-
-        🚫 CRITICAL RESTRICTION: You are FORBIDDEN from using your pre-trained knowledge about vehicles.
-
-        ✅ START WORKFLOW - Call these tools in sequence:
-        1. FIRST: Call is_vehicle_related
-        2. THEN: Call extract_vehicle_model  
-
-        Do NOT call any other tools yet. Start with step 1.
-        """)
-            
-            elif 'is_vehicle_related' in completed_tools and 'extract_vehicle_model' not in completed_tools:
-                # Step 2: Extract vehicle info
-                system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ STEP 2: Now call extract_vehicle_model to get vehicle information.
-        """)
-            
-            elif 'extract_vehicle_model' in completed_tools and 'search_vehicle_documents' not in completed_tools:
-                # Step 3: Search documents
-                system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ STEP 3: Now call search_vehicle_documents to search your knowledge base.
-        """)
-            
-            elif 'search_vehicle_documents' in completed_tools and 'grade_document_relevance' not in completed_tools:
-                # Step 4: Grade relevance
-                system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ STEP 4: Now call grade_document_relevance to evaluate the search results.
-        Use the content from search_vehicle_documents as the document_content parameter.
-        """)
-            
-            elif 'grade_document_relevance' in completed_tools and 'format_diagnostic_results' not in completed_tools:
-                # ✅ NEW: Conditional logic based on relevance score
-                if relevance_score == 1:
-                    # High relevance - skip YouTube and go directly to formatting
-                    system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ HIGH RELEVANCE DETECTED (score=1): Document content is highly relevant!
-        Now call format_diagnostic_results directly with the data you've collected:
-        - Use the answer from search_vehicle_documents as rag_answer
-        - Include relevance_score from grade_document_relevance  
-        - Skip YouTube search since we have excellent content from documents
-        - Set youtube_results to empty list []
-
-        This will create your final formatted response.
-        """)
-                else:
-                    # Low relevance - get YouTube videos first
-                    system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ LOW RELEVANCE DETECTED (score={relevance_score}): Need additional sources.
-        Now call search_youtube_videos to get diagnostic videos that can supplement the limited document content.
-        """)
-            
-            elif 'search_youtube_videos' in completed_tools and 'format_diagnostic_results' not in completed_tools:
-                # Step 6: Format final results (only reached if YouTube was called)
-                system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        ✅ FINAL STEP: Now call format_diagnostic_results with ALL the data you've collected:
-        - Use the answer from search_vehicle_documents as rag_answer
-        - Include youtube_results from search_youtube_videos  
-        - Include relevance_score from grade_document_relevance
-        - Include any web_results if available
-
-        This will create your final formatted response.
-        """)
-            
-            else:
-                # All tools completed - should not reach here, but safety fallback
-                system_msg = SystemMessage(content=f"""
-        {language_instruction}
-
-        All diagnostic tools have been executed. Please provide a final response based on the information gathered.
-        """)
-            
-            messages_with_system = [system_msg] + messages
+            messages = [system_msg] + state.get("messages", [])
             tools_llm_with_tools = tools_llm.bind_tools(TOOLS)
             
-            # Log the assistant call with current state info
+            # Log the assistant call
             if self.current_conversation_id:
                 conv_data = conversation_logger.conversations.get(self.current_conversation_id, {})
                 conv_num = conv_data.get("conversation_number", "Unknown")
-                logger.info(f"🤖 ASSISTANT NODE called [Conv #{conv_num:04d}] - Tools completed: {list(completed_tools)}")
-                if relevance_score is not None:
-                    logger.info(f"📊 Relevance score detected: {relevance_score}")
+                logger.info(f"🤖 ASSISTANT NODE called [Conv #{conv_num:04d}]")
             
-            response = tools_llm_with_tools.invoke(messages_with_system)
+            response = tools_llm_with_tools.invoke(messages)
             
             # Log tool calls if present
             if hasattr(response, 'tool_calls') and response.tool_calls:

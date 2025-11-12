@@ -307,6 +307,90 @@ def normalize_dtc_codes(text: str) -> str:
     normalized_text = re.sub(pattern, replace_dtc, text, flags=re.IGNORECASE)
     return normalized_text
 
+def rerank_documents_with_llm(docs: list, question: str, top_k: int = 2) -> list:
+    """Use LLM to rerank documents based on relevance to the question."""
+    
+    if len(docs) <= top_k:
+        return docs
+    
+    # Create document summaries for LLM evaluation
+    doc_summaries = []
+    for i, doc in enumerate(docs):
+        heading = doc.metadata.get("heading", "No Heading")[:100]
+        content_preview = doc.page_content[:300].replace('\n', ' ')
+        
+        doc_summaries.append({
+            'index': i,
+            'heading': heading,
+            'preview': content_preview,
+            'pages': doc.metadata.get("pages", []),
+            'char_count': len(doc.page_content)
+        })
+    
+    # Create reranking prompt
+    rerank_prompt = f"""
+You are an expert document ranker. Given a user question and a list of document chunks, rank them by relevance.
+
+QUESTION: {question}
+
+DOCUMENTS:
+"""
+    
+    for i, summary in enumerate(doc_summaries):
+        rerank_prompt += f"""
+Document {i+1}:
+- Heading: {summary['heading']}
+- Pages: {summary['pages']}
+- Preview: {summary['preview']}
+- Length: {summary['char_count']} chars
+
+"""
+    
+    rerank_prompt += f"""
+INSTRUCTIONS:
+1. Rank these documents from MOST relevant (1) to LEAST relevant ({len(doc_summaries)}) for answering the question
+2. Consider heading relevance, content preview, and likely completeness
+3. Prioritize documents that directly address the question topic
+4. Return ONLY a comma-separated list of document numbers in order of relevance
+
+Example: If documents 3, 1, 5 are most relevant, return: 3,1,5
+
+Your ranking:"""
+
+    try:
+        response = llm.invoke(rerank_prompt)
+        ranking_str = response.content.strip()
+        
+        # Parse the ranking
+        try:
+            rankings = [int(x.strip()) - 1 for x in ranking_str.split(',')]  # Convert to 0-based indexing
+            
+            # Validate rankings
+            valid_rankings = [r for r in rankings if 0 <= r < len(docs)]
+            
+            if valid_rankings:
+                # Reorder documents based on LLM ranking
+                reranked_docs = [docs[i] for i in valid_rankings[:top_k]]
+                
+                print(f"🤖 LLM Reranking Results:")
+                for rank, doc_idx in enumerate(valid_rankings[:top_k], 1):
+                    heading = docs[doc_idx].metadata.get("heading", "No Heading")[:50]
+                    print(f"  🏆 Rank {rank}: Doc {doc_idx + 1} - {heading}...")
+                
+                return reranked_docs
+            else:
+                print("⚠️ Invalid LLM ranking, using original order")
+                return docs[:top_k]
+                
+        except (ValueError, IndexError) as e:
+            print(f"⚠️ Error parsing LLM ranking: {e}, using original order")
+            return docs[:top_k]
+            
+    except Exception as e:
+        print(f"⚠️ Error in LLM reranking: {e}, using original order")
+        return docs[:top_k]
+    
+
 @tool
 def search_vehicle_documents(question: str, dtc_code: str = None, vehicle_info: str = None) -> dict:
     """Search vehicle diagnostic documents for relevant information."""
@@ -366,10 +450,30 @@ def search_vehicle_documents(question: str, dtc_code: str = None, vehicle_info: 
             
             print(f"  {i}. pages={pages} chars={len(d.page_content)}{media_str}")
             print(f"     snippet={snippet}")
+        
+        #top_docs = docs[:3] if len(docs) > 3 else docs
+        top_docs = rerank_documents_with_llm(docs, question, top_k=3)
+        # DEBUG: Print selected top chunks
+        print(f"\n🔝 TOP 3 CHUNKS SELECTED:")
 
+        
+        for i, d in enumerate(top_docs, 1):
+            pages = d.metadata.get("pages") or d.metadata.get("page") or "?"
+            heading = d.metadata.get("heading", "No Heading")[:50] + "..." if len(d.metadata.get("heading", "")) > 50 else d.metadata.get("heading", "No Heading")
+            chunk_index = d.metadata.get("chunk_index", "?")
+            source_file = d.metadata.get("source_file", "Unknown")
+            
+            print(f"  🏆 Rank {i}: Chunk #{chunk_index} from {source_file}")
+            print(f"      📄 Pages: {pages}")
+            print(f"      📝 Heading: {heading}")
+            print(f"      📊 Content Length: {len(d.page_content)} chars")
+            print(f"      🎯 Similarity Score: {d.metadata.get('similarity_score', 'N/A')}")
+        print()
         # Build context using the SAME format as rag_test_basic.py
+        
+
         blocks = []
-        for i, d in enumerate(docs, 1):
+        for i, d in enumerate(top_docs, 1):
             pages = d.metadata.get("pages") or d.metadata.get("page") or "?"
             
             # Format content with media information (like rag_test_basic)
@@ -378,8 +482,8 @@ def search_vehicle_documents(question: str, dtc_code: str = None, vehicle_info: 
             blocks.append(f"[DOC {i} | pages: {pages}]\n{formatted_content}")
         
         context = "\n\n".join(blocks)
-        
-        # Use the SAME prompt structure as rag_test_basic.py
+        #print(f"the context sent to llm is : {context}")
+
         prompt = (
             "You are a helpful automotive assistant. Answer the user's question using the provided context.\n\n"
             "CRITICAL PRESERVATION RULES:\n"
@@ -403,7 +507,9 @@ def search_vehicle_documents(question: str, dtc_code: str = None, vehicle_info: 
             f"Context from Documents:\n{context}\n\n"
             "Provide your answer following the format above:"
         )
-        
+
+
+
         response = llm.invoke(prompt)
         answer_text = response.content.strip()
         print(f"🤖 Direct LLM Answer: {answer_text}")
@@ -881,9 +987,6 @@ Format your response with clear sections and bullet points for better readabilit
                 }
             }
     
-    # Fallback: Return RAG content even if relevance is low (no web results available)
-    logger.info("Fallback: Using RAG content despite low relevance (no web results)")
-    print("⚠️ Fallback: No web results, using RAG content despite low relevance")
     processed_rag_content = process_content_with_inline_images(rag_content)
     voice_summary = create_voice_summary(processed_rag_content, question)
     
@@ -898,6 +1001,7 @@ Format your response with clear sections and bullet points for better readabilit
             }
         }
     }
+
 
 def process_content_with_inline_images(content: str) -> str:
     """Process content to display images and tables inline with steps (EXACT from version3_refactor)."""
