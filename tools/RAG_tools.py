@@ -11,6 +11,8 @@ import requests
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+import sys
+import numpy as np
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -28,12 +30,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # -------------------------
 # Paths and Setup
 # -------------------------
-BASE_DIR = Path(__file__).resolve().parents[1]
-CHROMA_DB_DIR = BASE_DIR / "output" / "chroma_db"
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+sys.path.insert(0, str(parent_dir))
 
-if not CHROMA_DB_DIR.exists() or not any(CHROMA_DB_DIR.iterdir()):
-    logger.error("❌ Chroma DB not found. Please run RAG setup first.")
-    # Don't exit, just log error - let the tools handle gracefully
+# Import the consistent paths from config
+from configs.RAG_config import FAISS_DB_DIR, FAISS_INDEX_PATH, FAISS_METADATA_PATH
+
+vector_store_type = "faiss"
 
 # -------------------------
 # Initialize LLM + embeddings + retriever
@@ -41,20 +45,124 @@ if not CHROMA_DB_DIR.exists() or not any(CHROMA_DB_DIR.iterdir()):
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing - set it in .env")
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-5-nano",temperature=0,openai_api_key=OPENAI_API_KEY)
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
+# FAISS imports
 try:
-    vectorstore = Chroma(
-        persist_directory=str(CHROMA_DB_DIR),
-        embedding_function=embeddings,
-        collection_name="pdf_chunks",
-    )
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    import faiss
+    import pickle
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("⚠️ FAISS not installed. Install with: pip install faiss-cpu (or faiss-gpu)")
+
+# Initialize retriever variable
+retriever = None
+
+class FAISSRetriever:
+    """FAISS-based retriever that mimics LangChain retriever interface"""
+    
+    def __init__(self):
+        self.index = None
+        self.metadata_store = []
+        self.id_to_index = {}
+        self.embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        self._init_faiss()
+    
+    def _init_faiss(self):
+        """Initialize FAISS with enhanced metadata format"""
+        print(f"🔧 Using FAISS vector store")
+        
+        if not FAISS_AVAILABLE:
+            logger.error("❌ FAISS not available. Install with: pip install faiss-cpu")
+            raise SystemExit(1)
+        
+        # Check if FAISS files exist
+        if not Path(FAISS_INDEX_PATH).exists() or not Path(FAISS_METADATA_PATH).exists():
+            logger.error(f"❌ FAISS index not found at {FAISS_INDEX_PATH} or {FAISS_METADATA_PATH}. Run rag_setup.py first.")
+            raise SystemExit(1)
+        
+        try:
+            # Load FAISS index
+            self.index = faiss.read_index(FAISS_INDEX_PATH)
+            
+            # Load enhanced metadata format
+            with open(FAISS_METADATA_PATH, 'rb') as f:
+                data = pickle.load(f)
+                self.metadata_store = data['metadata_store']
+                self.id_to_index = data['id_to_index']
+            
+            print(f"✅ FAISS vector store loaded successfully")
+            print(f"📊 Index contains {self.index.ntotal} vectors")
+            print(f"📝 Metadata store contains {len(self.metadata_store)} documents")
+            
+        except Exception as e:
+            logger.error(f"❌ Error loading FAISS vector store: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(1)
+    
+    def invoke(self, query: str, k: int = 5):
+        """Query FAISS and return LangChain-compatible Document objects"""
+        if self.index is None:
+            return []
+        
+        try:
+            # Generate query embedding
+            query_embedding = self.embeddings.embed_query(query)
+            query_vector = np.array([query_embedding], dtype=np.float32)
+            faiss.normalize_L2(query_vector)
+            
+            # Search
+            scores, indices = self.index.search(query_vector, k)
+            
+            # Convert to LangChain Document format
+            from langchain.docstore.document import Document
+            
+            documents = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx >= 0 and idx < len(self.metadata_store):
+                    metadata = self.metadata_store[idx]
+                    
+                    # Create LangChain-compatible metadata
+                    doc_metadata = {
+                        'pages': metadata.get('pages', [1]),
+                        'page': metadata.get('pages', [1])[0] if metadata.get('pages') else 1,
+                        'heading': metadata.get('heading', ''),
+                        'source_file': metadata.get('source_file', ''),
+                        'chunk_index': metadata.get('chunk_index', 0),
+                        'has_tables': metadata.get('has_tables', False),
+                        'has_figures': metadata.get('has_figures', False),
+                        'content_type': metadata.get('content_type', 'text'),
+                        'similarity_score': float(score),
+                    }
+                    
+                    # Create Document object
+                    doc = Document(
+                        page_content=metadata['text'],
+                        metadata=doc_metadata
+                    )
+                    documents.append(doc)
+            
+            return documents
+            
+        except Exception as e:
+            logger.error(f"❌ FAISS query error: {str(e)}")
+            return []
+
+# Initialize the retriever
+try:
+    if FAISS_AVAILABLE:
+        retriever = FAISSRetriever()
+        print("✅ FAISS retriever initialized successfully")
+    else:
+        logger.warning("FAISS not available, retriever will be None")
+        retriever = None
 except Exception as e:
-    logger.error(f"Failed to initialize Chroma vectorstore: {e}")
-    vectorstore = None
+    logger.error(f"Failed to initialize FAISS retriever: {e}")
     retriever = None
+
 
 # Retrieval grader setup
 grader_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=OPENAI_API_KEY)
@@ -83,75 +191,6 @@ def _get_nlp():
                 logger.warning(f"Could not load spacy model: {e}")
                 _nlp_model = None
     return _nlp_model
-
-# -------------------------
-# TOOL FUNCTIONS (Complete from version3_refactor.py)
-# -------------------------
-
-@tool
-def enhance_question_with_vehicle(question: str, vehicle_info: str = None, thread_id: str = "default") -> dict:
-    """Enhance the user's question by incorporating vehicle information."""
-    
-    logger.info(f"🔍 RAG TOOL CALLED: enhance_question_with_vehicle")
-    logger.info(f"🔍 Original question: {question}")
-    logger.info(f"🔍 Vehicle info: {vehicle_info}")
-    logger.info(f"🔍 Thread ID: {thread_id}")
-    
-    # Print vehicle info being used for this query
-    print(f"🚗 VEHICLE INFO USED: {vehicle_info if vehicle_info else 'None'}")
-    
-    if not vehicle_info:
-        return {
-            "enhanced_question": question,
-            "vehicle_added": False,
-            "message": "No vehicle information to add"
-        }
-    
-    # Check if question already contains the vehicle info
-    question_lower = question.lower()
-    vehicle_lower = vehicle_info.lower()
-    
-    if vehicle_lower in question_lower:
-        logger.info("Question already contains vehicle information")
-        return {
-            "enhanced_question": question,
-            "vehicle_added": False,
-            "message": "Question already contains vehicle information"
-        }
-    
-    # Don't enhance if it's a DTC code question
-    if re.search(r'\b[PB]\d{4}\b', question):
-        logger.info("Question contains DTC code, not enhancing")
-        return {
-            "enhanced_question": question,
-            "vehicle_added": False,
-            "message": "DTC question - no enhancement needed"
-        }
-    
-    # Try to naturally incorporate vehicle info
-    enhanced_question = question
-    vehicle_added = False
-    
-    if "how" in question_lower and any(word in question_lower for word in ['change', 'replace', 'fix', 'repair']):
-        # Transform "how can i change brake pads" → "how can i change brake pads of Honda Civic"
-        enhanced_question = question.rstrip('?') + f" of {vehicle_info}?"
-        vehicle_added = True
-    elif "what" in question_lower:
-        # Transform "what is wrong with my engine" → "what is wrong with my Honda Civic engine"
-        enhanced_question = question.replace("my ", f"my {vehicle_info} ")
-        vehicle_added = True
-    else:
-        # Generic enhancement - add vehicle at the beginning
-        enhanced_question = f"{vehicle_info}: {question}"
-        vehicle_added = True
-    
-    logger.info(f"Enhanced question: {enhanced_question}")
-    
-    return {
-        "enhanced_question": enhanced_question,
-        "vehicle_added": vehicle_added,
-        "message": f"Enhanced question with {vehicle_info}"
-    }
 
 
 @tool
@@ -342,10 +381,27 @@ def search_vehicle_documents(question: str, dtc_code: str = None, vehicle_info: 
         
         # Use the SAME prompt structure as rag_test_basic.py
         prompt = (
-            "You are a helpful assistant. Answer the question ONLY using the provided context. "
-            "When referencing images, figures, or tables mentioned in the context, include them in your response. "
-            "If the answer is not present, reply exactly: I don't know.\n\n"
-            f"Question: {question}\n\nContext:\n{context}\n\nAnswer:"
+            "You are a helpful automotive assistant. Answer the user's question using the provided context.\n\n"
+            "CRITICAL PRESERVATION RULES:\n"
+            "1. When the context contains image markdown (![...](...)): Copy the EXACT line without any changes\n"
+            "2. When the context contains tables (lines with | characters): Copy the ENTIRE table block exactly as shown\n"
+            "3. When the context contains numbered steps: Copy the exact numbering and text\n"
+            "4. DO NOT summarize, rephrase, or reformat any images, tables, or step procedures\n"
+            "5. DO NOT change file paths in image links (even if they look like C:\\\\... paths)\n\n"
+            "OUTPUT FORMAT:\n"
+            "- Provide a direct answer to the question (2-3 sentences)\n"
+            "- If relevant images/tables/steps exist in context, include a section:\n"
+            "  '### References from document'\n"
+            "- Under References, paste the relevant markdown blocks EXACTLY as they appear\n"
+            "- Include ALL relevant images/tables/steps that help answer the question\n\n"
+            "EXAMPLE OF WHAT TO PRESERVE:\n"
+            "- Images: ![Image](C:\\\\path\\\\image.jpg) ← Copy this EXACTLY\n"
+            "- Tables: | Header | Value | ← Copy entire table including all rows\n"
+            "- Steps: 1. Check the sensor... ← Copy exact numbering and text\n\n"
+            "Your task: Answer the question and preserve all relevant visual/structured content VERBATIM.\n\n"
+            f"User Question: {question}\n\n"
+            f"Context from Documents:\n{context}\n\n"
+            "Provide your answer following the format above:"
         )
         
         response = llm.invoke(prompt)
@@ -987,7 +1043,6 @@ __all__ = [
     "is_vehicle_related",
     "extract_vehicle_model", 
     "search_vehicle_documents",
-    "enhance_question_with_vehicle",
     "grade_document_relevance",
     "search_web_for_vehicle_info",
     "search_youtube_videos",
