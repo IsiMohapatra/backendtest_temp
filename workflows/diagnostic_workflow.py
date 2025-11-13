@@ -18,8 +18,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from tools.RAG_tools import (
-    is_vehicle_related, extract_vehicle_model, search_vehicle_documents,
-    grade_document_relevance, search_web_for_vehicle_info, search_youtube_videos,
+    search_vehicle_documents,grade_document_relevance, search_web_for_vehicle_info, search_youtube_videos,
     format_diagnostic_results, llm as tools_llm
 )
 
@@ -36,8 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOOLS = [
-    is_vehicle_related, extract_vehicle_model, search_vehicle_documents,
-    grade_document_relevance, search_web_for_vehicle_info, search_youtube_videos,
+    search_vehicle_documents,grade_document_relevance, search_web_for_vehicle_info, search_youtube_videos,
     format_diagnostic_results
 ]
 
@@ -409,148 +407,107 @@ class AsyncDiagnosticAgent:
             }
             language_instruction = lang_directives.get(self.target_language, lang_directives["en"])
 
-            # ...existing code...
+            # Fix: Use proper conditional logic
+            if self.vehicle_info:
+                workflow_steps = f"""
+        🚗 VEHICLE INFO AVAILABLE: {self.vehicle_info}
 
-            # ...existing code...
+        MANDATORY WORKFLOW - Follow this EXACT sequence:
+
+        STEP 1: ALWAYS call search_vehicle_documents  
+        - Never skip this step - searches knowledge base for vehicle-specific information
+
+        STEP 2: ALWAYS call grade_document_relevance 
+        - Pass: question, document_content, chunk_label
+        - This determines if retrieved information is sufficient
+
+        STEP 3: ⚠️ CRITICAL DECISION POINT - CHECK RELEVANCE SCORE:
+
+        🟢 IF grade_document_relevance returns relevance_score: 1
+            → SKIP web and youtube search
+            → DIRECTLY call format_diagnostic_results
+            → Pass: web_results: [], youtube_results: []
+
+        🔴 IF grade_document_relevance returns relevance_score: 0
+            → MUST call search_web_for_vehicle_info 
+            → MUST call search_youtube_videos
+            → THEN call format_diagnostic_results
+            → Extract data from web/youtube tools properly
+
+        STEP 4: ALWAYS call format_diagnostic_results as FINAL step
+        """
+            else:
+                workflow_steps = f"""
+        ❌ NO VEHICLE INFO PROVIDED 
+
+        MANDATORY WORKFLOW - Follow this EXACT sequence:
+
+        STEP 1: SKIP search_vehicle_documents and grade_document_relevance
+        - No specific vehicle info available, skip RAG database search
+
+        STEP 2: ALWAYS call search_web_for_vehicle_info
+        - Search web for general automotive information
+
+        STEP 3: ALWAYS call search_youtube_videos
+        - Search YouTube for relevant videos
+
+        STEP 4: ALWAYS call format_diagnostic_results as FINAL step
+        - Pass empty rag_answer: ""
+        - Include web_results and youtube_results from steps 2 & 3
+        """
 
             system_msg = SystemMessage(content=f"""
-You are Allion, a RAG-based automotive diagnostic assistant.
+        You are Allion, a RAG-based automotive diagnostic assistant.
 
-{language_instruction}
+        {language_instruction}
 
-🚫 CRITICAL RESTRICTION: You are FORBIDDEN from using your pre-trained knowledge about vehicles.
-🚫 You MUST NOT answer any automotive question without using the provided tools.
-🚫 If you cannot get information through tools, you must say "I don't have that information in my database."
+        🚫 CRITICAL RESTRICTIONS:
+        - You are FORBIDDEN from using your pre-trained knowledge about vehicles
+        - You MUST NOT answer any automotive question without using the provided tools
+        - If you cannot get information through tools, say "I don't have that information in my database"
 
-✅ MANDATORY TOOL WORKFLOW - You MUST follow this EXACT sequence for ALL queries:
+        {workflow_steps}
 
-STEP 1: ALWAYS call is_vehicle_related first
-- If not vehicle-related, politely decline
+        🔍 CRITICAL DATA EXTRACTION REQUIREMENTS:
+        
+        🔴 IF you called search_web_for_vehicle_info:
+        → Extract the "results" field from tool response
+        → Pass as web_results: [extracted_results_list]
+        
+        🔴 IF you called search_youtube_videos:
+        → Extract the "youtube_results" field from tool response  
+        → Pass as youtube_results: [extracted_youtube_list]
+        
+        🟢 IF you skipped web/youtube search (relevance_score = 1):
+        → Pass empty lists: web_results: [], youtube_results: []
 
-STEP 2: ALWAYS call extract_vehicle_model
-- Even for DTC questions, call this tool
-                                       
-STEP 3: Check vehicle info requirement:
-    - For repair/maintenance questions: IF no vehicle found → STOP and ask for make/model
-    - For DTC codes (P0301, etc.): Continue without requiring vehicle info
-    - Generate response: "Could you please specify the make and model of your vehicle? For example, 'Honda Civic' or 'Toyota Camry'. This helps me provide more accurate diagnostic information."
+        EXAMPLE DATA EXTRACTION:
+        If search_web_for_vehicle_info returned:
+        {{"results": [{{"url": "...", "title": "...", "content": "..."}}]}}
+
+        Then pass to format_diagnostic_results:
+        web_results: [{{"url": "...", "title": "...", "content": "..."}}]
+
+        🚨 FORMAT REQUIREMENTS:
+        * web_results: MUST be actual list from "results" field
+        * youtube_results: MUST be actual list from "youtube_results" field  
+        * rag_answer: MUST preserve ALL markdown formatting, images, tables
+        * DO NOT modify or summarize the rag_answer content
+
+        🚨 DATA PRESERVATION:
+        - When relevance_score = 1: Preserve ALL image links, tables, formatting from RAG
+        - When relevance_score = 0: Include ALL web sources and YouTube videos found
+        - NEVER pass empty web_results/youtube_results when data was actually found
+
+        🚨 FORBIDDEN BEHAVIORS:
+        - NEVER use automotive knowledge when tools return no information
+        - NEVER skip mandatory tools for your current workflow path
+        - NEVER call format_diagnostic_results with relevance_score=0 WITHOUT calling web+youtube search first
+
+        Vehicle Status: {"✅ Available - " + self.vehicle_info if self.vehicle_info else "❌ Not Available"}
+        """)
     
-STEP 4: IF vehicle info available, enhance the question
-    - Transform "how to change brake pads" + "Honda Civic" → "how to change brake pads of Honda Civic"                                       
-
-STEP 5: ALWAYS call search_vehicle_documents  
-- Never skip this step
-- This searches your knowledge base for relevant information
-
-STEP 6: ALWAYS call grade_document_relevance 
-- Pass: question, document_content, chunk_label
-- This determines if the retrieved information is sufficient
-
-STEP 7: ⚠️ CRITICAL DECISION POINT - CHECK RELEVANCE SCORE:
-
-🟢 IF the grade_document_relevance tool returned relevance_score: 1
-    → Skip to STEP 8 (format_diagnostic_results)
-    → Do NOT call search_web_for_vehicle_info
-    → Do NOT call search_youtube_videos
-
-🔴 IF the grade_document_relevance tool returned relevance_score: 0
-    → You MUST call search_web_for_vehicle_info NEXT
-    → You MUST call search_youtube_videos AFTER that  
-    → ONLY THEN proceed to STEP 8
-    → This is MANDATORY - do not skip these tools when relevance_score = 0
-
-# ...existing code...
-
-STEP 8: ALWAYS call format_diagnostic_results as the FINAL step
-- CRITICAL DATA EXTRACTION REQUIREMENTS:
-  
-  🔴 IF you called search_web_for_vehicle_info:
-    → Extract the "results" field from the tool response
-    → Pass it as web_results: [extracted_results_list]
     
-  🔴 IF you called search_youtube_videos:
-    → Extract the "youtube_results" field from the tool response  
-    → Pass it as youtube_results: [extracted_youtube_list]
-    
-  🟢 IF you skipped web/youtube search (relevance_score = 1):
-    → Pass empty lists: web_results: [], youtube_results: []
-
-- EXAMPLE DATA EXTRACTION:
-  If search_web_for_vehicle_info returned:
-  {{"results": [{{"url": "...", "title": "...", "content": "..."}}]}}
-  
-  Then pass to format_diagnostic_results:
-  web_results: [{{"url": "...", "title": "...", "content": "..."}}]
-  
-  If search_youtube_videos returned:
-  {{"youtube_results": [{{"url": "...", "video_id": "...", "title": "..."}}]}}
-  
-  Then pass to format_diagnostic_results:
-  youtube_results: [{{"url": "...", "video_id": "...", "title": "..."}}]
-
-- CRITICAL FORMAT REQUIREMENTS:
-  * web_results: MUST be the actual list from the "results" field
-  * youtube_results: MUST be the actual list from the "youtube_results" field  
-  * rag_answer: MUST preserve ALL markdown formatting, images, and tables.Do not summarize the content. Preserve as it is with actual content.
-  * DO NOT modify or summarize the rag_answer content
-
-🚨 DATA PRESERVATION REQUIREMENTS:
-- When relevance_score = 1: Preserve ALL image links, tables, and formatting from RAG content
-- When relevance_score = 0: Include ALL web sources and YouTube videos found
-- NEVER pass empty web_results/youtube_results when data was actually found
-
-# ...existing code...
-
-🚨 FORBIDDEN BEHAVIORS:
-- NEVER call format_diagnostic_results when relevance_score = 0 WITHOUT first calling search_web_for_vehicle_info and search_youtube_videos
-- NEVER skip search_web_for_vehicle_info when relevance_score = 0
-- NEVER skip search_youtube_videos when relevance_score = 0
-- Do NOT use your automotive knowledge when tools return no information
-
-🔍 DECISION FLOWCHART:
-grade_document_relevance returns relevance_score of 0
-                    ↓
-              MUST call search_web_for_vehicle_info
-                    ↓  
-              MUST call search_youtube_videos
-                    ↓
-              THEN call format_diagnostic_results
-
-grade_document_relevance returns relevance_score of 1
-                    ↓
-              SKIP web and youtube search
-                    ↓
-              DIRECTLY call format_diagnostic_results
-
-✅ EXAMPLE CORRECT SEQUENCES:
-
-Scenario A (Good RAG content):
-1. is_vehicle_related
-2. extract_vehicle_model  
-3. search_vehicle_documents
-4. grade_document_relevance → relevance_score: 1
-5. format_diagnostic_results ✅ CORRECT
-
-Scenario B (Poor RAG content):
-1. is_vehicle_related
-2. extract_vehicle_model
-3. search_vehicle_documents  
-4. grade_document_relevance → relevance_score: 0
-5. search_web_for_vehicle_info ← MANDATORY
-6. search_youtube_videos ← MANDATORY
-7. format_diagnostic_results ✅ CORRECT
-
-❌ WRONG SEQUENCE (NEVER DO THIS):
-4. grade_document_relevance → relevance_score: 0
-5. format_diagnostic_results ← FORBIDDEN! Must search web+youtube first
-
-REMEMBER: When relevance_score = 0, you MUST gather additional information from web and YouTube before formatting the final response.
-""")
-            
-# ...existing code...
-            
-# ...existing code...
-            
             messages = [system_msg] + state.get("messages", [])
             tools_llm_with_tools = tools_llm.bind_tools(TOOLS)
             
@@ -701,25 +658,6 @@ REMEMBER: When relevance_score = 0, you MUST gather additional information from 
                 return "ಸ್ವಾಗತ! ನಿಮ್ಮ ವಾಹನದ ಬಗ್ಗೆ ಇನ್ನಷ್ಟು ಸಹಾಯ ಬೇಕೆ?"
             return "You're welcome! Do you need any more help with your vehicle?"
         
-        try:
-            from tools.RAG_tools import is_vehicle_related
-            
-            result = is_vehicle_related.invoke({"question": message})
-            is_vehicle = result.get("is_vehicle_related", False)
-            
-            if not is_vehicle:
-                if self.target_language == "hi":
-                    return "मैं वाहन निदान में विशेषज्ञ हूँ 🚗। कृपया कार से संबंधित प्रश्न पूछें।"
-                if self.target_language == "kn":
-                    return "ನಾನು ವಾಹನ ಡಯಾಗ್ನೋಸ್ಟಿಕ್ಸ್‌ನಲ್ಲಿ ಪರಿಣತಿ ಹೊಂದಿದ್ದೇನೆ 🚗. ದಯವಿಟ್ಟು ಕಾರಿಗೆ ಸಂಬಂಧಿಸಿದ ಪ್ರಶ್ನೆ ಕೇಳಿ."
-                return "I specialize in vehicle diagnostics 🚗. Could you please ask me something related to your car?"
-            
-        except Exception as e:
-            logger.warning(f"Error checking if message is vehicle-related: {e}")
-
-        # ✅ If it's vehicle-related → continue with RAG
-        logger.info(f"✅ Vehicle-related detected: '{msg}' - continuing with RAG")
-        return None
 
     async def chat(self, message: str, thread_id: str = "default") -> str:
         """
@@ -938,7 +876,7 @@ class DiagnosticLLMAdapter(LLM):
         self.target_language = (target_language or "en").lower()
         self.room = room  # Store room reference for data channel publishing
         self.vehicle = vehicle
-        self.model = model
+        self.vehicle_model = model  # Use vehicle_model instead of model to avoid conflict
         if self.target_language not in {"en", "hi", "kn"}:
             self.target_language = "en"
 
@@ -950,7 +888,7 @@ class DiagnosticLLMAdapter(LLM):
             self._agent = AsyncDiagnosticAgent(
                 target_language=self.target_language,
                 vehicle=self.vehicle,
-                model=self.model
+                model=self.vehicle_model  # Use vehicle_model here
             )
             # Schedule initialization
             self._loop.create_task(self._agent.initialize())

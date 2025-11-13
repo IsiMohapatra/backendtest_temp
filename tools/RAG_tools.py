@@ -175,104 +175,6 @@ Question: {question} Fact: {documents}""",
 )
 retrieval_grader = grader_prompt | grader_llm | JsonOutputParser()
 
-# Global NLP model (lazy-loaded)
-_nlp_model = None
-
-def _get_nlp():
-    global _nlp_model
-    if _nlp_model is None:
-        import spacy
-        try:
-            _nlp_model = spacy.load("en_core_web_trf")
-        except Exception:
-            try:
-                _nlp_model = spacy.load("en_core_web_sm")
-            except Exception as e:
-                logger.warning(f"Could not load spacy model: {e}")
-                _nlp_model = None
-    return _nlp_model
-
-
-@tool
-def is_vehicle_related(question: str) -> dict:
-    """Check if the question is vehicle-related before processing."""
-    classifier_prompt = f"""
-You are a classifier. Decide if the user question is about vehicle diagnostics, repair, or automotive problems.
-Answer YES if it's about vehicle issues, maintenance, repairs, faults, or checks.
-Answer NO if it's unrelated to vehicles.
-Examples:
-- "How do I replace my brake pads?" → YES
-- "What is the capital of France?" → NO
-- "Can I change the engine oil myself?" → YES
-- "Tell me a joke." → NO
-QUESTION: {question}
-Answer only with "YES" or "NO".
-"""
-    try:
-        response = llm.invoke(classifier_prompt)
-        is_related = response.content.strip().upper() == "YES"
-        logger.info(f"Vehicle relation check: {question[:50]}... → {is_related}")
-        return {
-            "is_vehicle_related": is_related,
-            "message": "Vehicle-related question detected" if is_related else "Not vehicle-related",
-        }
-    except Exception as e:
-        logger.error(f"Error in vehicle relation check: {e}")
-        return {"is_vehicle_related": True, "message": "Error in classification, defaulting to vehicle-related"}
-
-@tool
-def extract_vehicle_model(question: str) -> dict:
-    """Extract vehicle make and model from the question using NLP."""
-    nlp_model = _get_nlp()
-    if not nlp_model:
-        logger.warning("NLP model not available, falling back to simple extraction")
-        # Simple fallback extraction
-        words = question.split()
-        potential_vehicle = []
-        for i, word in enumerate(words):
-            if word.lower() in ['toyota', 'honda', 'ford', 'bmw', 'mercedes', 'audi', 'volkswagen', 'nissan', 'hyundai', 'kia']:
-                potential_vehicle.append(word.title())
-                if i + 1 < len(words):
-                    potential_vehicle.append(words[i + 1].title())
-                break
-        
-        if potential_vehicle:
-            vehicle_info = " ".join(potential_vehicle[:2])
-            return {"vehicle_info": vehicle_info, "found": True}
-        else:
-            return {"vehicle_info": None, "found": False}
-    
-    doc = nlp_model(question)
-    entities = []
-    
-    for ent in doc.ents:
-        if ent.label_ in ["ORG", "PRODUCT"]:
-            model_tokens = [ent.text]
-            next_token = ent.end
-            while next_token < len(doc) and (
-                doc[next_token].is_title or doc[next_token].like_num or doc[next_token].is_lower
-            ):
-                model_tokens.append(doc[next_token].text)
-                next_token += 1
-            entities.append(" ".join(model_tokens))
-
-    if entities:
-        vehicle_info = entities[0].title()
-    else:
-        tokens = [t for t in doc if not t.is_stop and t.pos_ in ["PROPN", "NUM", "NOUN"]]
-        if len(tokens) >= 2:
-            model_tokens = []
-            for t in tokens:
-                if t.pos_ in ["PROPN", "NUM"]:
-                    model_tokens.append(t.text)
-                else:
-                    break
-            vehicle_info = " ".join(model_tokens).title() if model_tokens else None
-        else:
-            vehicle_info = None
-
-    logger.info(f"Vehicle extraction: {question[:50]}... → {vehicle_info}")
-    return {"vehicle_info": vehicle_info, "found": vehicle_info is not None}
 
 def normalize_dtc_codes(text: str) -> str:
     """
@@ -852,21 +754,6 @@ def format_diagnostic_results(
     if use_rag:
         logger.info("Using RAG answer with step/image/table formatting")
         processed_rag_content = process_content_with_inline_images(rag_content)
-        
-        # Remove YouTube URLs from content since we have them in structured format
-        if structured_youtube_videos:
-            for video in structured_youtube_videos:
-                video_url = video["url"]
-                # Remove the URL from the main content (handle various line formats)
-                processed_rag_content = processed_rag_content.replace(video_url, "")
-                # Also remove common patterns like "- {url}" or "• {url}"
-                processed_rag_content = re.sub(rf'^[•\-\*]\s*{re.escape(video_url)}\s*$', '', processed_rag_content, flags=re.MULTILINE)
-                # Clean up empty lines
-                processed_rag_content = re.sub(r'\n\s*\n\s*\n', '\n\n', processed_rag_content)
-            processed_rag_content = processed_rag_content.strip()
-        
-        # Clean any HTML artifacts and decode Unicode escape sequences
-        processed_rag_content = clean_html_artifacts(processed_rag_content)
         voice_summary = create_voice_summary(processed_rag_content, question)
         
         return {
@@ -1144,8 +1031,6 @@ Example format: "The [code] indicates [main issue]. The primary causes are [brie
 
 # Export all tools
 __all__ = [
-    "is_vehicle_related",
-    "extract_vehicle_model", 
     "search_vehicle_documents",
     "grade_document_relevance",
     "search_web_for_vehicle_info",
