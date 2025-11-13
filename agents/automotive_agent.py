@@ -43,20 +43,25 @@ def load_prompts(agent: str) -> dict:
  
 class Assistant(VisionCapabilities, Agent):
     """Automotive assistant with improved async handling."""
- 
-    def __init__(self) -> None:
+
+    def __init__(self, vehicle: str = None, model: str = None) -> None:
         prompts = load_prompts("automotive")
         Agent.__init__(self, instructions=prompts["instructions"])
         VisionCapabilities.__init__(self)
         self.greetings = prompts.get("greetings", {})
         self.diagnostic_agent = None
+        self.vehicle = vehicle
+        self.model = model
     async def initialize_diagnostic_agent(self):
         """Initialize the diagnostic agent asynchronously."""
         if self.diagnostic_agent is None:
             # Lazy import to avoid import errors when virtual environment is not activated
             try:
                 from workflows.diagnostic_workflow import AsyncDiagnosticAgent
-                self.diagnostic_agent = AsyncDiagnosticAgent()
+                self.diagnostic_agent = AsyncDiagnosticAgent(
+                    vehicle=self.vehicle, 
+                    model=self.model
+                )
                 await self.diagnostic_agent.initialize()
             except ImportError as e:
                 logger.error(f"Failed to import AsyncDiagnosticAgent: {e}")
@@ -76,10 +81,10 @@ class Assistant(VisionCapabilities, Agent):
         return await self.diagnostic_agent.chat(message)
  
  
-def get_simplified_config(lang_code: str, voice_base: str):
-    """Simplified config selection."""
+def get_simplified_config(lang_code: str, voice_base: str, vehicle: str = None, model: str = None):
+    """Simplified config selection with vehicle information."""
     from configs.language_config import get_config_for_language
-    return get_config_for_language(lang_code, voice_base)
+    return get_config_for_language(lang_code, voice_base, vehicle=vehicle, model=model)
  
  
 async def entrypoint(ctx: agents.JobContext) -> None:
@@ -91,6 +96,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     cfg_box = {
         "language": os.getenv("AGENT_LANG", "en").lower(),
         "voiceBase": os.getenv("AGENT_VOICEBASE", "Voice Assistant"),
+        "vehicle": None,
+        "model": None,
     }
     got_config = asyncio.Event()
  
@@ -105,6 +112,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 got_config.set()
             if "voiceBase" in payload and payload["voiceBase"] in ("Voice Assistant", "Live Assistant"):
                 cfg_box["voiceBase"] = payload["voiceBase"]
+                got_config.set()
+            if "vehicle" in payload and payload["vehicle"]:
+                cfg_box["vehicle"] = payload["vehicle"]
+                logger.info(f"Vehicle information received: {payload['vehicle']}")
+                got_config.set()
+            if "model" in payload and payload["model"]:
+                cfg_box["model"] = payload["model"]
+                logger.info(f"Model information received: {payload['model']}")
                 got_config.set()
         except Exception as e:
             logger.warning(f"Metadata parse error: {e}")
@@ -137,8 +152,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # Get configuration
     lang = cfg_box["language"]
     voice_base = cfg_box["voiceBase"]
-    logger.info(f"Using config: language={lang}, voiceBase={voice_base}")
-    config_dict = get_simplified_config(lang, voice_base)
+    vehicle = cfg_box["vehicle"]
+    model = cfg_box["model"]
+    logger.info(f"Using config: language={lang}, voiceBase={voice_base}, vehicle={vehicle}, model={model}")
+    config_dict = get_simplified_config(lang, voice_base, vehicle=vehicle, model=model)
     
     # Create session and assistant
     session = AgentSession(**config_dict)
@@ -148,7 +165,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         config_dict["llm"].room = ctx.room
         logger.info("✅ Set room reference on DiagnosticLLMAdapter for data channel publishing")
     
-    assistant = Assistant()
+    assistant = Assistant(vehicle=vehicle, model=model)
     try:
         # Start session
         await session.start(

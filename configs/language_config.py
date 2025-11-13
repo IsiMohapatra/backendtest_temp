@@ -18,9 +18,9 @@ COMMON_CONFIG = {
 class LanguageConfig:
     """Base configuration class for all languages."""
     @staticmethod
-    def get_diagnostic_llm(language: str = "en", room=None):
+    def get_diagnostic_llm(language: str = "en", room=None, vehicle: str = None, model: str = None):
         """Get the diagnostic agent wrapped as LLM adapter, with language enforced."""
-        return DiagnosticLLMAdapter(target_language=language, room=room)
+        return DiagnosticLLMAdapter(target_language=language, room=room, vehicle=vehicle, model=model)
 
     @classmethod
     def get_base_config(cls):
@@ -30,7 +30,7 @@ class LanguageConfig:
 class EnglishConfig(LanguageConfig):
     """English voice assistant configuration."""
     @classmethod
-    def get_config(cls, voice_base: str = "Voice Assistant"):
+    def get_config(cls, voice_base: str = "Voice Assistant", vehicle: str = None, model: str = None):
         config = cls.get_base_config()
         if voice_base == "Live Assistant":
             config.update({
@@ -48,7 +48,7 @@ class EnglishConfig(LanguageConfig):
         else:
             # Voice Assistant mode: Use LangGraph workflow with RAG capabilities
             config.update({
-                "llm": cls.get_diagnostic_llm(language="en"),
+                "llm": cls.get_diagnostic_llm(language="en", vehicle=vehicle, model=model),
                 "stt": deepgram.STT(model="nova-3", language="multi"),
                 "tts": cartesia.TTS(
                     model="sonic-2",
@@ -60,7 +60,7 @@ class EnglishConfig(LanguageConfig):
 class HindiConfig(LanguageConfig):
     """Hindi voice assistant configuration."""
     @classmethod
-    def get_config(cls, voice_base: str = "Voice Assistant"):
+    def get_config(cls, voice_base: str = "Voice Assistant", vehicle: str = None, model: str = None):
         config = cls.get_base_config()
         if voice_base == "Live Assistant":
             config.update({
@@ -80,7 +80,7 @@ class HindiConfig(LanguageConfig):
             })
         else:
             config.update({
-                "llm": cls.get_diagnostic_llm(language="hi"),
+                "llm": cls.get_diagnostic_llm(language="hi", vehicle=vehicle, model=model),
                 "stt": sarvam.STT(model="saarika:v2.5", language="hi-IN"),
                 "tts": sarvam.TTS(
                     target_language_code="hi-IN",
@@ -93,7 +93,7 @@ class HindiConfig(LanguageConfig):
 class KannadaConfig(LanguageConfig):
     """Kannada voice assistant configuration."""
     @classmethod  
-    def get_config(cls, voice_base: str = "Voice Assistant"):
+    def get_config(cls, voice_base: str = "Voice Assistant", vehicle: str = None, model: str = None):
         config = cls.get_base_config()
         if voice_base == "Live Assistant":
             config.update({
@@ -113,7 +113,7 @@ class KannadaConfig(LanguageConfig):
             })
         else:
             config.update({
-                "llm": cls.get_diagnostic_llm(language="kn"),
+                "llm": cls.get_diagnostic_llm(language="kn", vehicle=vehicle, model=model),
                 "stt": sarvam.STT(model="saarika:v2.5", language="kn-IN"),
                 "tts": sarvam.TTS(
                     target_language_code="kn-IN",
@@ -124,12 +124,12 @@ class KannadaConfig(LanguageConfig):
         return config
 
 # Factory function for backwards compatibility
-def get_config_for_language(language_code: str, voice_base: str = "Voice Assistant"):
-    """Factory function to get configuration for a specific language."""
+def get_config_for_language(language_code: str, voice_base: str = "Voice Assistant", vehicle: str = None, model: str = None):
+    """Factory function to get configuration for a specific language and vehicle info."""
     config_map = {
         "en": EnglishConfig,
         "hi": HindiConfig, 
         "kn": KannadaConfig,
     }
     config_class = config_map.get(language_code, EnglishConfig)
-    return config_class.get_config(voice_base)
+    return config_class.get_config(voice_base, vehicle=vehicle, model=model)

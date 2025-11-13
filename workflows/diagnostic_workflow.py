@@ -341,7 +341,7 @@ class AsyncDiagnosticAgent:
     Async-first diagnostic agent with DTC code normalization and target-language control.
     Enhanced with comprehensive session-based logging.
     """
-    def __init__(self, target_language: str = "en"):
+    def __init__(self, target_language: str = "en", vehicle: str = None, model: str = None):
         self._graph = None
         self._active_tasks: set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
@@ -350,6 +350,17 @@ class AsyncDiagnosticAgent:
         self.target_language = (target_language or "en").lower()
         if self.target_language not in {"en", "hi", "kn"}:
             self.target_language = "en"
+        
+        # Vehicle information from frontend
+        self.vehicle = vehicle
+        self.model = model
+        self.vehicle_info = None
+        if vehicle and model:
+            self.vehicle_info = f"{vehicle} {model}"
+            logger.info(f"🚗 Vehicle info set: {self.vehicle_info}")
+        elif vehicle:
+            self.vehicle_info = vehicle
+            logger.info(f"🚗 Vehicle make set: {self.vehicle_info}")
         
         # Conversation tracking
         self.current_conversation_id: Optional[str] = None
@@ -793,8 +804,15 @@ REMEMBER: When relevance_score = 0, you MUST gather additional information from 
             # Reset tool call tracking
             self._tool_calls_log = []
             
+            # Enhance message with vehicle information if available
+            enhanced_message = message
+            if self.vehicle_info:
+                # Add vehicle information context to the message
+                enhanced_message = f"Vehicle: {self.vehicle_info}. Question: {message}"
+                logger.info(f"🚗 Enhanced message with vehicle info: {enhanced_message}")
+            
             result = await self._graph.ainvoke(
-                {"messages": [HumanMessage(content=message)]},
+                {"messages": [HumanMessage(content=enhanced_message)]},
                 config={"configurable": {"thread_id": thread_id}}
             )
             
@@ -897,9 +915,9 @@ REMEMBER: When relevance_score = 0, you MUST gather additional information from 
         return conversation_logger.get_conversation_summary(conversation_id)
 
 # Factory function for configs
-async def create_diagnostic_agent(target_language: str = "en"):
-    """Create and initialize a diagnostic agent with language control."""
-    agent = AsyncDiagnosticAgent(target_language=target_language)
+async def create_diagnostic_agent(target_language: str = "en", vehicle: str = None, model: str = None):
+    """Create and initialize a diagnostic agent with language control and vehicle info."""
+    agent = AsyncDiagnosticAgent(target_language=target_language, vehicle=vehicle, model=model)
     await agent.initialize()
     return agent
 
@@ -913,12 +931,14 @@ class DiagnosticLLMAdapter(LLM):
     Adapter that implements LiveKit LLM interface using async agent internally,
     with enforced target language. Publishes diagnostic data via data channel.
     """
-    def __init__(self, target_language: str = "en", room=None):
+    def __init__(self, target_language: str = "en", room=None, vehicle: str = None, model: str = None):
         super().__init__()
         self._agent: Optional[AsyncDiagnosticAgent] = None
         self._loop = None
         self.target_language = (target_language or "en").lower()
         self.room = room  # Store room reference for data channel publishing
+        self.vehicle = vehicle
+        self.model = model
         if self.target_language not in {"en", "hi", "kn"}:
             self.target_language = "en"
 
@@ -927,7 +947,11 @@ class DiagnosticLLMAdapter(LLM):
         current_loop = asyncio.get_event_loop()
         if self._agent is None or self._loop != current_loop:
             self._loop = current_loop
-            self._agent = AsyncDiagnosticAgent(target_language=self.target_language)
+            self._agent = AsyncDiagnosticAgent(
+                target_language=self.target_language,
+                vehicle=self.vehicle,
+                model=self.model
+            )
             # Schedule initialization
             self._loop.create_task(self._agent.initialize())
 
